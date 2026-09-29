@@ -1,0 +1,9 @@
+[package]
+name = "zygote"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+nix = { version = "0.29", features = ["process", "signal", "fs"] }
+libc = "0.2"

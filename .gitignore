@@ -1,0 +1,10 @@
+# Rust target directory
+/target/
+
+# Temporary and editor files
+*.swp
+*.swo
+*~
+*.bak
+*.log
+.DS_Store
