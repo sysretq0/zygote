@@ -1,9 +1,10 @@
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Maximum number of in-flight spawned children awaiting execve confirmation before applying backpressure.
 const MAX_IN_FLIGHT_SPAWNS: usize = 128;
@@ -14,34 +15,103 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Maximum buffer size for a single SEQPACKET payload (64 KB).
 const REQ_BUF_SIZE: usize = 65536;
 
-/// Socket send/receive buffer size (256 KB) to prevent EAGAIN under burst conditions.
-const SOCKET_BUFFER_SIZE: libc::c_int = 256 * 1024;
+/// Maximum queued responses per client before the stalled client is disconnected.
+const MAX_OUT_QUEUE_LEN: usize = 256;
+
+/// Maximum time a child may take to report execve status before SIGKILL.
+const CHILD_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of packets processed from a single client per poll turn to prevent starvation.
 const MAX_PACKETS_PER_TURN: usize = 32;
 
-/// Ancillary control message buffer aligned to 8 bytes (size_t / cmsghdr alignment).
-#[repr(align(8))]
-struct CmsgBuf([u8; 64]);
-
-impl CmsgBuf {
-    #[inline]
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
 /// Global shutdown signal flag set by SIGINT or SIGTERM handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// C-ABI signal handler for graceful shutdown.
+/// Write end of the self-pipe used to wake `poll()` instantly on SIGINT/SIGTERM.
+static SHUTDOWN_PIPE_WR: AtomicI32 = AtomicI32::new(-1);
+
+/// Last millis timestamp of a rate-limited invalid-packet log (1 msg/sec max).
+static INVALID_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// C-ABI signal handler for graceful shutdown: sets flag and wakes poll() via self-pipe.
 extern "C" fn sig_term_handler(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
+    let wr = SHUTDOWN_PIPE_WR.load(Ordering::SeqCst);
+    if wr >= 0 {
+        let b = [1u8];
+        unsafe {
+            libc::write(wr, b.as_ptr().cast(), 1);
+        }
+    }
+}
+
+/// Non-panicking stderr log (never uses println!/eprintln! which may panic on broken pipes).
+fn log_to_stderr(msg: &str) {
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+}
+
+fn log_info(msg: &str) {
+    let mut s = String::with_capacity(msg.len() + 10);
+    s.push_str("[zygote] ");
+    s.push_str(msg);
+    s.push('\n');
+    log_to_stderr(&s);
+}
+
+fn log_warn(msg: &str) {
+    let mut s = String::with_capacity(msg.len() + 10);
+    s.push_str("[zygote] ");
+    s.push_str(msg);
+    s.push('\n');
+    log_to_stderr(&s);
+}
+
+/// Rate-limited invalid-packet log: at most one message per second to avoid log flooding.
+fn log_invalid_ratelimited(msg: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = INVALID_LOG_LAST_MS.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= 1000 {
+        INVALID_LOG_LAST_MS.store(now, Ordering::Relaxed);
+        log_warn(msg);
+    }
+}
+
+/// Ensure FDs 0, 1, 2 are valid so pipe_tx / sockets are always >= 3.
+/// Opens /dev/null until the returned fd exceeds 2 (kept opens fill 0..=2).
+fn sanitize_std_fds() {
+    loop {
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            break;
+        }
+        if fd > 2 {
+            unsafe { libc::close(fd) };
+            break;
+        }
+        // fd is 0, 1 or 2: intentionally leaked to occupy the std slot.
+    }
+}
+
+/// Parse optional `--allow-uid <uid>` / `--allow-uid=<uid>` CLI argument.
+fn parse_allow_uid() -> Option<u32> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(a) = args.next() {
+        if a == "--allow-uid" {
+            if let Some(v) = args.next() {
+                if let Ok(uid) = v.parse::<u32>() {
+                    return Some(uid);
+                }
+            }
+        } else if let Some(rest) = a.strip_prefix("--allow-uid=") {
+            if let Ok(uid) = rest.parse::<u32>() {
+                return Some(uid);
+            }
+        }
+    }
+    None
 }
 
 /// Pre-cached environment pointer table constructed once at startup.
@@ -79,12 +149,13 @@ struct ClientInfo {
     out_queue: VecDeque<Vec<u8>>,
 }
 
-/// Tracking metadata for an in-flight child process awaiting execve completion.
+/// Tracking metadata for an in-flight child process awaiting execve confirmation.
 struct PendingChild {
     _pipe_rx: OwnedFd,
     client_id: u64,
     req_id: u64,
     child_pid: i32,
+    spawned_at: Instant,
 }
 
 /// Configure signal handlers:
@@ -119,26 +190,6 @@ fn setup_signals() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Sets SO_SNDBUF and SO_RCVBUF to 256 KB on a socket.
-fn configure_socket_buffers(fd: RawFd) {
-    unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&SOCKET_BUFFER_SIZE as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            (&SOCKET_BUFFER_SIZE as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-    }
-}
-
 /// Creates a non-blocking listening SOCK_SEQPACKET socket bound to Linux abstract namespace.
 fn create_listener_seqpacket(abstract_name: &[u8]) -> Result<OwnedFd, std::io::Error> {
     let fd = unsafe {
@@ -152,7 +203,7 @@ fn create_listener_seqpacket(abstract_name: &[u8]) -> Result<OwnedFd, std::io::E
         return Err(std::io::Error::last_os_error());
     }
 
-    configure_socket_buffers(fd);
+    protocol::configure_socket_buffers(fd);
 
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -168,7 +219,7 @@ fn create_listener_seqpacket(abstract_name: &[u8]) -> Result<OwnedFd, std::io::E
     unsafe {
         std::ptr::copy_nonoverlapping(
             abstract_name.as_ptr(),
-            addr.sun_path.as_mut_ptr().add(1) as *mut u8,
+            addr.sun_path.as_mut_ptr().add(1),
             abstract_name.len(),
         );
     }
@@ -312,6 +363,7 @@ unsafe fn close_inherited_except(preserved_fd: libc::c_int) {
 /// Child process logic executed immediately after fork().
 /// Does not return: always invokes execve() or exits with _exit(127).
 /// Performs ZERO heap allocations.
+#[allow(clippy::too_many_arguments)]
 unsafe fn child_exec(
     redirect_null: bool,
     new_session: bool,
@@ -396,17 +448,21 @@ unsafe fn child_exec(
     libc::_exit(127);
 }
 
-/// RAII guard to ensure passed stdio descriptors are closed on early return, error, or parent post-fork,
-/// unless explicitly disarmed in the child process.
+/// RAII guard holding received stdio descriptors as OwnedFd so Rust's drop
+/// checker closes each descriptor exactly once on both success and error paths.
 struct StdioGuard {
-    stdin_fd: Option<i32>,
-    stdout_fd: Option<i32>,
-    stderr_fd: Option<i32>,
+    stdin_fd: Option<OwnedFd>,
+    stdout_fd: Option<OwnedFd>,
+    stderr_fd: Option<OwnedFd>,
     disarmed: bool,
 }
 
 impl StdioGuard {
-    fn new(stdin_fd: Option<i32>, stdout_fd: Option<i32>, stderr_fd: Option<i32>) -> Self {
+    fn new(
+        stdin_fd: Option<OwnedFd>,
+        stdout_fd: Option<OwnedFd>,
+        stderr_fd: Option<OwnedFd>,
+    ) -> Self {
         Self {
             stdin_fd,
             stdout_fd,
@@ -415,21 +471,37 @@ impl StdioGuard {
         }
     }
 
+    /// Release ownership without closing: the child keeps the raw fds across
+    /// fork (they are dup2'd then reaped by `close_inherited_except`).
+    /// Must leak via `into_raw_fd` here because struct fields are still
+    /// dropped (closed) after `Drop::drop` finishes, so merely setting
+    /// `disarmed = true` would not prevent the close.
     fn disarm(&mut self) {
         self.disarmed = true;
+        if let Some(fd) = self.stdin_fd.take() {
+            let _ = fd.into_raw_fd();
+        }
+        if let Some(fd) = self.stdout_fd.take() {
+            let _ = fd.into_raw_fd();
+        }
+        if let Some(fd) = self.stderr_fd.take() {
+            let _ = fd.into_raw_fd();
+        }
+    }
+
+    fn raw(&self) -> (Option<RawFd>, Option<RawFd>, Option<RawFd>) {
+        (
+            self.stdin_fd.as_ref().map(|f| f.as_raw_fd()),
+            self.stdout_fd.as_ref().map(|f| f.as_raw_fd()),
+            self.stderr_fd.as_ref().map(|f| f.as_raw_fd()),
+        )
     }
 
     fn close(&mut self) {
         if !self.disarmed {
-            if let Some(fd) = self.stdin_fd.take() {
-                unsafe { libc::close(fd) };
-            }
-            if let Some(fd) = self.stdout_fd.take() {
-                unsafe { libc::close(fd) };
-            }
-            if let Some(fd) = self.stderr_fd.take() {
-                unsafe { libc::close(fd) };
-            }
+            self.stdin_fd.take();
+            self.stdout_fd.take();
+            self.stderr_fd.take();
         }
     }
 }
@@ -442,12 +514,23 @@ impl Drop for StdioGuard {
 
 /// Prepares strings and pointer arrays before fork(), creates a CLOEXEC synchronization pipe,
 /// calls unsafe fork(), and returns the child's read pipe and PID without blocking on execve.
+///
+/// Pre-exec verification / O_CLOEXEC EOF semantics (F7):
+/// The sync pipe is created O_CLOEXEC. The child holds the write end across
+/// fork and execve: a successful execve atomically closes the write end at the
+/// kernel CLOEXEC boundary, so the parent's `read(pipe_rx)` observes EOF (0
+/// bytes) which unambiguously reports success. If execve (or dup2/chdir)
+/// fails first, the child writes the 4-byte errno then `_exit(127)`, so the
+/// parent reads exactly 4 bytes. Note the SA_NOCLDWAIT limitation: the daemon
+/// cannot waitpid() to distinguish "child killed by a signal before exec"
+/// (which also closes the write end and looks like EOF) from a true exec;
+/// callers needing that distinction should verify child liveness (kill(pid,0)).
 fn launch_child(
     request: &protocol::SpawnRequest,
-    stdin_fd: Option<i32>,
-    stdout_fd: Option<i32>,
-    stderr_fd: Option<i32>,
-    devnull_fd: i32,
+    stdin_fd: Option<OwnedFd>,
+    stdout_fd: Option<OwnedFd>,
+    stderr_fd: Option<OwnedFd>,
+    devnull_fd: RawFd,
     cached_env: &CachedEnv,
 ) -> Result<(OwnedFd, i32), String> {
     let mut stdio_guard = StdioGuard::new(stdin_fd, stdout_fd, stderr_fd);
@@ -504,7 +587,9 @@ fn launch_child(
         (Some(env_strings), Some(env_ptrs), ptr)
     };
 
-    // Create an O_CLOEXEC synchronization pipe (with pre-2.6.27 fallback)
+    // Create an O_CLOEXEC synchronization pipe (with pre-2.6.27 fallback).
+    // EOF on pipe_rx after fork means execve succeeded (CLOEXEC closed pipe_tx
+    // at the kernel exec boundary); 4 bytes means pre-exec failure errno.
     let (pipe_rx, pipe_tx) = create_pipe_cloexec()?;
 
     let pipe_tx_raw = pipe_tx.as_raw_fd();
@@ -512,6 +597,7 @@ fn launch_child(
     let path_ptr = path_c.as_ptr();
     let redirect_null = request.redirect_null;
     let new_session = request.new_session;
+    let (stdin_raw, stdout_raw, stderr_raw) = stdio_guard.raw();
 
     let fork_res = unsafe { nix::unistd::fork() };
 
@@ -523,9 +609,9 @@ fn launch_child(
                 child_exec(
                     redirect_null,
                     new_session,
-                    stdin_fd,
-                    stdout_fd,
-                    stderr_fd,
+                    stdin_raw,
+                    stdout_raw,
+                    stderr_raw,
                     devnull_fd,
                     path_ptr,
                     argv_ptr,
@@ -548,7 +634,12 @@ fn launch_child(
 }
 
 /// Send a response packet to a client or queue it if the socket buffer is full (EAGAIN).
-fn send_or_queue_response(client: &mut ClientInfo, packet: &[u8]) {
+/// Returns false when the per-client queue exceeds MAX_OUT_QUEUE_LEN: caller must
+/// disconnect the stalled client to bound memory.
+fn send_or_queue_response(client: &mut ClientInfo, packet: &[u8]) -> bool {
+    if client.out_queue.len() >= MAX_OUT_QUEUE_LEN {
+        return false;
+    }
     if client.out_queue.is_empty() {
         let n = unsafe {
             libc::send(
@@ -559,19 +650,65 @@ fn send_or_queue_response(client: &mut ClientInfo, packet: &[u8]) {
             )
         };
         if n >= 0 {
-            return;
+            return true;
         }
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
             client.out_queue.push_back(packet.to_vec());
-            return;
+            return client.out_queue.len() <= MAX_OUT_QUEUE_LEN;
         }
-    } else {
+        // Hard send errors are handled by the caller via disconnect on POLLOUT flush;
+        // here we queue so the flush path observes and disconnects on next POLLOUT.
+        // To keep behavior simple, report true and let flush disconnect on EPIPE.
         client.out_queue.push_back(packet.to_vec());
+        return client.out_queue.len() <= MAX_OUT_QUEUE_LEN;
+    }
+    client.out_queue.push_back(packet.to_vec());
+    client.out_queue.len() <= MAX_OUT_QUEUE_LEN
+}
+
+/// Queue an error response for a pending child whose client may be gone; drops if client vanished.
+fn respond_to_client(
+    clients: &mut HashMap<RawFd, ClientInfo>,
+    client_id: u64,
+    resp: &protocol::SpawnResponse,
+    resp_buf: &mut Vec<u8>,
+    overflowed: &mut Vec<RawFd>,
+) {
+    let _ = protocol::encode_packet_into(resp, resp_buf);
+    if let Some((&fd, _)) = clients.iter().find(|(_, c)| c.id == client_id) {
+        let ok = clients
+            .get_mut(&fd)
+            .is_some_and(|c| send_or_queue_response(c, resp_buf));
+        if !ok {
+            overflowed.push(fd);
+        }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // F6: sanitize FDs 0..=2 first so pipe_tx / sockets are always >= 3.
+    sanitize_std_fds();
+
+    let allow_uid = parse_allow_uid();
+
+    // O5: self-pipe so SIGINT/SIGTERM wakes poll() instantly (no 1s delay).
+    let mut selfpipe_raw = [0 as libc::c_int; 2];
+    if unsafe {
+        libc::pipe2(
+            selfpipe_raw.as_mut_ptr(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(Box::new(std::io::Error::last_os_error()));
+    }
+    let shutdown_pipe_rd = unsafe { OwnedFd::from_raw_fd(selfpipe_raw[0]) };
+    let shutdown_pipe_wr = unsafe { OwnedFd::from_raw_fd(selfpipe_raw[1]) };
+    SHUTDOWN_PIPE_WR.store(shutdown_pipe_wr.as_raw_fd(), Ordering::SeqCst);
+    // Keep write end alive for the daemon lifetime (raw stored in static for handler).
+    std::mem::forget(shutdown_pipe_wr);
+
     setup_signals()?;
 
     // Cache default environment at startup
@@ -580,20 +717,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cache /dev/null descriptor with O_CLOEXEC for child standard I/O redirection
     let devnull_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if devnull_fd < 0 {
-        eprintln!(
-            "[zygote] Warning: Failed to open /dev/null (errno: {}), redirection disabled",
+        log_warn(&format!(
+            "Warning: Failed to open /dev/null (errno: {}), redirection disabled",
             std::io::Error::last_os_error()
-        );
+        ));
     }
 
     // Bind Linux abstract namespace SOCK_SEQPACKET socket (\0zygote)
     let listener = create_listener_seqpacket(protocol::DEFAULT_ABSTRACT_NAME)?;
     let listener_fd = listener.as_raw_fd();
 
-    println!(
-        "[zygote] Single-threaded process spawner listening on abstract SOCK_SEQPACKET socket @{}",
+    log_info(&format!(
+        "Single-threaded process spawner listening on abstract SOCK_SEQPACKET socket @{}",
         String::from_utf8_lossy(protocol::DEFAULT_ABSTRACT_NAME)
-    );
+    ));
 
     // Pre-allocated reusable buffers for zero allocations in hot loop
     let mut req_buf = vec![0u8; REQ_BUF_SIZE];
@@ -626,6 +763,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         poll_fds.clear();
+
+        // O5: self-pipe first so signals wake poll() immediately.
+        poll_fds.push(libc::pollfd {
+            fd: shutdown_pipe_rd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
 
         // Only listen for new incoming client connections if NOT shutting down and not backed off
         if !is_shutting_down && accept_backoff_until.is_none() {
@@ -669,7 +813,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = shutdown_start.unwrap().elapsed();
             let remaining =
                 SHUTDOWN_DRAIN_TIMEOUT.saturating_sub(elapsed).as_millis() as libc::c_int;
-            remaining.min(50).max(1)
+            remaining.clamp(1, 50)
         } else if let Some(deadline) = accept_backoff_until {
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
@@ -694,13 +838,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            eprintln!("[zygote] poll error: {err}");
+            log_warn(&format!("poll error: {err}"));
             break;
+        }
+
+        // O5: drain self-pipe when signaled.
+        if let Some(sp) = poll_fds.first() {
+            if sp.revents & libc::POLLIN != 0 {
+                let mut tmp = [0u8; 64];
+                loop {
+                    let n = unsafe {
+                        libc::read(
+                            shutdown_pipe_rd.as_raw_fd(),
+                            tmp.as_mut_ptr().cast(),
+                            tmp.len(),
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                    if (n as usize) < tmp.len() {
+                        break;
+                    }
+                }
+            }
         }
 
         // --------------------------------------------------------------------
         // PHASE 1: Prioritize processing and draining ready child pipes FIRST
         // --------------------------------------------------------------------
+        // F7: O_CLOEXEC EOF semantics: read()==0 means the write end was closed
+        // by a successful execve at the kernel CLOEXEC boundary -> success.
+        // read()==4 carries the pre-exec errno (dup2/chdir/execve failure).
+        // Anything else is a malformed status. See launch_child docs for the
+        // SA_NOCLDWAIT caveat (signal death pre-exec also looks like EOF).
         let mut completed_children = Vec::new();
         for pfd in &poll_fds {
             if pfd.revents == 0 {
@@ -713,6 +884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let mut overflowed: Vec<RawFd> = Vec::new();
         for pipe_fd in completed_children {
             if let Some(pending) = pending_children.remove(&pipe_fd) {
                 let mut err_buf = [0u8; 4];
@@ -733,10 +905,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 };
 
-                // Find destination client and send or queue response packet
-                if let Some(client) = clients.values_mut().find(|c| c.id == pending.client_id) {
-                    let _ = protocol::encode_packet_into(&response, &mut resp_buf);
-                    send_or_queue_response(client, &resp_buf);
+                respond_to_client(
+                    &mut clients,
+                    pending.client_id,
+                    &response,
+                    &mut resp_buf,
+                    &mut overflowed,
+                );
+            }
+        }
+
+        // F5: kill children that never report execve status within 5s.
+        {
+            let now = Instant::now();
+            let expired: Vec<RawFd> = pending_children
+                .iter()
+                .filter(|(_, p)| now.duration_since(p.spawned_at) >= CHILD_EXEC_TIMEOUT)
+                .map(|(&fd, _)| fd)
+                .collect();
+            for pipe_fd in expired {
+                if let Some(pending) = pending_children.remove(&pipe_fd) {
+                    unsafe { libc::kill(pending.child_pid, libc::SIGKILL) };
+                    // pipe_rx closed here by OwnedFd drop.
+                    log_invalid_ratelimited(&format!(
+                        "Child {} exec timeout after 5s, SIGKILL sent",
+                        pending.child_pid
+                    ));
+                    let resp = protocol::SpawnResponse::error(
+                        pending.req_id,
+                        "Child exec timeout (SIGKILL sent after 5s)",
+                    );
+                    respond_to_client(
+                        &mut clients,
+                        pending.client_id,
+                        &resp,
+                        &mut resp_buf,
+                        &mut overflowed,
+                    );
                 }
             }
         }
@@ -745,6 +950,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // PHASE 2: Flush outgoing queues on POLLOUT and process incoming requests
         // --------------------------------------------------------------------
         let mut disconnected_clients = Vec::new();
+        disconnected_clients.extend(overflowed);
         for pfd in &poll_fds {
             if pfd.revents == 0 {
                 continue;
@@ -789,109 +995,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // 2B: Read incoming requests if POLLIN is ready
                 if pfd.revents & libc::POLLIN != 0 {
+                    if disconnected_clients.contains(&client_fd) {
+                        continue;
+                    }
                     let client_id = clients[&client_fd].id;
                     let mut packets_processed = 0;
 
                     while packets_processed < MAX_PACKETS_PER_TURN {
-                        let mut req_iov = libc::iovec {
-                            iov_base: req_buf.as_mut_ptr().cast(),
-                            iov_len: req_buf.len(),
-                        };
-                        let mut cmsg_buf = CmsgBuf([0u8; 64]);
-                        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                        msg.msg_iov = &mut req_iov;
-                        msg.msg_iovlen = 1;
-                        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-                        msg.msg_controllen = cmsg_buf.len();
-
-                        let n = unsafe {
-                            libc::recvmsg(
-                                client_fd,
-                                &mut msg,
-                                libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC | libc::MSG_TRUNC,
-                            )
-                        };
-
-                        if n == 0 {
-                            disconnected_clients.push(client_fd);
+                        // F5: strict in-flight cap before every recvmsg iteration.
+                        if pending_children.len() >= MAX_IN_FLIGHT_SPAWNS {
                             break;
-                        } else if n < 0 {
-                            let err = std::io::Error::last_os_error();
-                            if err.kind() == std::io::ErrorKind::WouldBlock {
-                                break;
-                            } else if err.kind() == std::io::ErrorKind::Interrupted {
-                                continue;
-                            } else {
-                                disconnected_clients.push(client_fd);
-                                break;
-                            }
                         }
+                        let mut cmsg_buf = protocol::CmsgBuf::new();
+                        let outcome = match protocol::recv_packet_with_fds(
+                            client_fd,
+                            &mut req_buf,
+                            &mut cmsg_buf,
+                        ) {
+                            Ok(o) => o,
+                            Err(err) => {
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    break;
+                                } else if err.kind() == std::io::ErrorKind::Interrupted {
+                                    continue;
+                                } else {
+                                    disconnected_clients.push(client_fd);
+                                    break;
+                                }
+                            }
+                        };
 
                         packets_processed += 1;
+                        // Owned fds; dropped exactly once on every path below.
+                        let rec_fds: Vec<OwnedFd> = outcome.fds;
 
-                        // Extract any passed SCM_RIGHTS file descriptors
-                        let mut rec_fds = Vec::new();
-                        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-                        while !cmsg.is_null() {
-                            unsafe {
-                                if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                                {
-                                    let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::c_int;
-                                    let base_len = libc::CMSG_LEN(0) as usize;
-                                    if (*cmsg).cmsg_len >= base_len {
-                                        let num_fds = ((*cmsg).cmsg_len - base_len)
-                                            / std::mem::size_of::<libc::c_int>();
-                                        for i in 0..num_fds {
-                                            rec_fds.push(*data_ptr.add(i));
+                        // F3: no id prefix -> cannot correlate a reply; close connection.
+                        if outcome.reported_len < 8 {
+                            disconnected_clients.push(client_fd);
+                            break;
+                        }
+                        let prefix_len = outcome.reported_len.min(req_buf.len());
+                        let req_id_opt =
+                            protocol::extract_req_id(&req_buf[..prefix_len]);
+
+                        // CTRUNC: ancillary data incomplete; fds already dropped.
+                        if outcome.ctrunc {
+                            log_invalid_ratelimited("Ancillary data truncated (MSG_CTRUNC)");
+                            match req_id_opt {
+                                Some(req_id) => {
+                                    let resp = protocol::SpawnResponse::error(
+                                        req_id,
+                                        "Ancillary data truncated (MSG_CTRUNC)",
+                                    );
+                                    let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
+                                    if let Some(client) = clients.get_mut(&client_fd) {
+                                        if !send_or_queue_response(client, &resp_buf) {
+                                            disconnected_clients.push(client_fd);
+                                            break;
                                         }
                                     }
                                 }
-                                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-                            }
-                        }
-
-                        // Check if control data was truncated (F4)
-                        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-                            for fd in rec_fds {
-                                unsafe { libc::close(fd) };
-                            }
-                            eprintln!("[zygote] Ancillary data truncated (MSG_CTRUNC)");
-                            let resp = protocol::SpawnResponse::error(
-                                0,
-                                "Ancillary data truncated (MSG_CTRUNC)",
-                            );
-                            let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
-                            if let Some(client) = clients.get_mut(&client_fd) {
-                                send_or_queue_response(client, &resp_buf);
+                                None => {
+                                    disconnected_clients.push(client_fd);
+                                    break;
+                                }
                             }
                             break;
                         }
 
-                        // Detect truncated packets via MSG_TRUNC (Refinement 2)
-                        let is_truncated =
-                            (n as usize) > req_buf.len() || (msg.msg_flags & libc::MSG_TRUNC != 0);
-
-                        if is_truncated {
-                            for fd in rec_fds {
-                                unsafe { libc::close(fd) };
-                            }
-                            eprintln!(
-                                "[zygote] Truncated packet received (length: {n} > max {})",
+                        if outcome.truncated {
+                            log_invalid_ratelimited(&format!(
+                                "Truncated packet received (length: {} > max {})",
+                                outcome.reported_len,
                                 req_buf.len()
-                            );
-                            let resp = protocol::SpawnResponse::error(
-                                0,
-                                "Payload exceeds max packet size",
-                            );
-                            let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
-                            if let Some(client) = clients.get_mut(&client_fd) {
-                                send_or_queue_response(client, &resp_buf);
+                            ));
+                            match req_id_opt {
+                                Some(req_id) => {
+                                    let resp = protocol::SpawnResponse::error(
+                                        req_id,
+                                        "Payload exceeds max packet size",
+                                    );
+                                    let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
+                                    if let Some(client) = clients.get_mut(&client_fd) {
+                                        if !send_or_queue_response(client, &resp_buf) {
+                                            disconnected_clients.push(client_fd);
+                                            break;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    disconnected_clients.push(client_fd);
+                                    break;
+                                }
                             }
                             break;
                         }
 
-                        let packet = &req_buf[..n as usize];
+                        let packet = &req_buf[..outcome.reported_len];
                         match protocol::decode_packet::<protocol::SpawnRequest>(packet) {
                             Ok(request) => {
                                 let expected_fds = request.expected_fd_count();
@@ -901,38 +1101,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         expected_fds,
                                         rec_fds.len()
                                     );
-                                    for fd in rec_fds {
-                                        unsafe { libc::close(fd) };
-                                    }
-                                    let resp = protocol::SpawnResponse::error(request.id, err_msg);
+                                    let resp =
+                                        protocol::SpawnResponse::error(request.id, err_msg);
                                     let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
                                     if let Some(client) = clients.get_mut(&client_fd) {
-                                        send_or_queue_response(client, &resp_buf);
+                                        if !send_or_queue_response(client, &resp_buf) {
+                                            disconnected_clients.push(client_fd);
+                                            break;
+                                        }
                                     }
                                     continue;
                                 }
 
-                                let mut fd_idx = 0;
-                                let stdin_fd = if request.pass_stdin {
-                                    let fd = rec_fds[fd_idx];
-                                    fd_idx += 1;
-                                    Some(fd)
-                                } else {
-                                    None
-                                };
-                                let stdout_fd = if request.pass_stdout {
-                                    let fd = rec_fds[fd_idx];
-                                    fd_idx += 1;
-                                    Some(fd)
-                                } else {
-                                    None
-                                };
-                                let stderr_fd = if request.pass_stderr {
-                                    let fd = rec_fds[fd_idx];
-                                    Some(fd)
-                                } else {
-                                    None
-                                };
+                                // Split owned fds in wire order: stdin, stdout, stderr.
+                                let mut owned_iter = rec_fds.into_iter();
+                                let stdin_fd =
+                                    if request.pass_stdin { owned_iter.next() } else { None };
+                                let stdout_fd =
+                                    if request.pass_stdout { owned_iter.next() } else { None };
+                                let stderr_fd =
+                                    if request.pass_stderr { owned_iter.next() } else { None };
 
                                 match launch_child(
                                     &request,
@@ -951,6 +1139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 client_id,
                                                 req_id: request.id,
                                                 child_pid,
+                                                spawned_at: Instant::now(),
                                             },
                                         );
                                     }
@@ -959,34 +1148,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             protocol::SpawnResponse::error(request.id, err_msg);
                                         let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
                                         if let Some(client) = clients.get_mut(&client_fd) {
-                                            send_or_queue_response(client, &resp_buf);
+                                            if !send_or_queue_response(client, &resp_buf) {
+                                                disconnected_clients.push(client_fd);
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                for fd in rec_fds {
-                                    unsafe { libc::close(fd) };
+                                // F3: never hang: reply with extracted req_id when available.
+                                log_invalid_ratelimited(&format!(
+                                    "Packet deserialization error: {e}"
+                                ));
+                                match req_id_opt {
+                                    Some(req_id) => {
+                                        let resp = protocol::SpawnResponse::error(
+                                            req_id,
+                                            format!("Invalid packet: {e}"),
+                                        );
+                                        let _ =
+                                            protocol::encode_packet_into(&resp, &mut resp_buf);
+                                        if let Some(client) = clients.get_mut(&client_fd) {
+                                            if !send_or_queue_response(client, &resp_buf) {
+                                                disconnected_clients.push(client_fd);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        disconnected_clients.push(client_fd);
+                                        break;
+                                    }
                                 }
-                                eprintln!("[zygote] Packet deserialization error: {e}");
                             }
-                        }
-
-                        if pending_children.len() >= MAX_IN_FLIGHT_SPAWNS {
-                            break;
                         }
                     }
                 }
             }
         }
 
-        // Remove disconnected clients
+        // Remove disconnected clients (F8: includes out_queue overflow victims).
         for fd in disconnected_clients {
             clients.remove(&fd);
         }
 
         // --------------------------------------------------------------------
-        // PHASE 3: Process listener socket with UID access control
+        // PHASE 3: Process listener socket with strict UID access control (F1)
         // --------------------------------------------------------------------
         let listener_ready = poll_fds
             .iter()
@@ -1004,28 +1212,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if client_raw >= 0 {
-                configure_socket_buffers(client_raw);
+                protocol::configure_socket_buffers(client_raw);
 
-                // Verify peer credentials via SO_PEERCRED
-                let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
-                let mut len: libc::socklen_t =
-                    std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-                let ret = unsafe {
-                    libc::getsockopt(
-                        client_raw,
-                        libc::SOL_SOCKET,
-                        libc::SO_PEERCRED,
-                        (&mut ucred as *mut libc::ucred).cast(),
-                        &mut len,
-                    )
-                };
-
+                // F1: strictly enforce peer uid == daemon euid (optional --allow-uid).
+                // No root bypass: a root daemon rejects unprivileged peers by default.
                 let my_euid = unsafe { libc::geteuid() };
-                if ret < 0 || (my_euid != 0 && ucred.uid != my_euid) {
-                    eprintln!(
-                        "[zygote] Rejecting connection: peer UID {} != server EUID {}",
-                        ucred.uid, my_euid
-                    );
+                let peer_ok = match protocol::peer_cred_uid(client_raw) {
+                    Ok(peer_uid) => {
+                        protocol::peer_uid_allowed(peer_uid, my_euid, allow_uid)
+                    }
+                    Err(_) => false,
+                };
+                if !peer_ok {
+                    let peer_desc = match protocol::peer_cred_uid(client_raw) {
+                        Ok(u) => u.to_string(),
+                        Err(_) => "unknown".to_string(),
+                    };
+                    log_warn(&format!(
+                        "Rejecting connection: peer UID {peer_desc} != server EUID {my_euid}"
+                    ));
                     unsafe { libc::close(client_raw) };
                 } else {
                     let client_fd = unsafe { OwnedFd::from_raw_fd(client_raw) };
@@ -1044,12 +1249,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if err.raw_os_error() == Some(libc::EMFILE)
                     || err.raw_os_error() == Some(libc::ENFILE)
                 {
-                    eprintln!("[zygote] FD limit reached in accept4 ({err}), backing off 50ms");
+                    log_warn(&format!("FD limit reached in accept4 ({err}), backing off 50ms"));
                     accept_backoff_until = Some(Instant::now() + Duration::from_millis(50));
                 } else if err.kind() != std::io::ErrorKind::WouldBlock
                     && err.kind() != std::io::ErrorKind::Interrupted
                 {
-                    eprintln!("[zygote] accept error: {err}");
+                    log_warn(&format!("accept error: {err}"));
                 }
             }
         }
@@ -1059,12 +1264,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unsafe { libc::close(devnull_fd) };
     }
 
-    println!("[zygote] Daemon stopped gracefully.");
+    log_info("Daemon stopped gracefully.");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
     #[test]
     fn test_getdents64() {
         let dir_fd = unsafe {
@@ -1126,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_recv_fds() {
+    fn test_send_recv_fds_shared_helpers() {
         let mut fds = [0; 2];
         let ret = unsafe {
             libc::socketpair(
@@ -1138,128 +1346,93 @@ mod tests {
         };
         assert_eq!(ret, 0);
 
-        let (sock_tx, sock_rx) = (fds[0], fds[1]);
+        let sock_tx = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let sock_rx = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
         let mut pipe_fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let (p_rx, p_tx) = (pipe_fds[0], pipe_fds[1]);
+        let p_rx = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let p_tx = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
-        let payload = b"hello";
-        let mut iov = libc::iovec {
-            iov_base: payload.as_ptr() as *mut libc::c_void,
-            iov_len: payload.len(),
-        };
-
-        let mut cmsg_buf = [0u8; 64];
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-        msg.msg_controllen =
-            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
-
-        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
-        unsafe {
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize;
-            std::ptr::copy_nonoverlapping(
-                &p_tx as *const libc::c_int,
-                libc::CMSG_DATA(cmsg).cast(),
-                1,
-            );
-        }
-
-        let sent = unsafe { libc::sendmsg(sock_tx, &msg, 0) };
+        let sent = protocol::send_packet_with_fds(
+            sock_tx.as_raw_fd(),
+            b"hello",
+            &[p_tx.as_raw_fd()],
+        )
+        .expect("send");
         assert_eq!(sent, 5);
+        drop(p_tx);
 
         let mut recv_buf = [0u8; 64];
-        let mut recv_iov = libc::iovec {
-            iov_base: recv_buf.as_mut_ptr().cast(),
-            iov_len: recv_buf.len(),
-        };
-        let mut recv_cmsg_buf = [0u8; 64];
-        let mut recv_msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        recv_msg.msg_iov = &mut recv_iov;
-        recv_msg.msg_iovlen = 1;
-        recv_msg.msg_control = recv_cmsg_buf.as_mut_ptr().cast();
-        recv_msg.msg_controllen = recv_cmsg_buf.len();
-
-        let n = unsafe { libc::recvmsg(sock_rx, &mut recv_msg, libc::MSG_CMSG_CLOEXEC) };
-        assert_eq!(n, 5);
+        let mut cmsg = protocol::CmsgBuf::new();
+        let out =
+            protocol::recv_packet_with_fds(sock_rx.as_raw_fd(), &mut recv_buf, &mut cmsg)
+                .expect("recv");
+        assert_eq!(out.reported_len, 5);
         assert_eq!(&recv_buf[..5], b"hello");
+        assert_eq!(out.fds.len(), 1);
 
-        let rec_cmsg = unsafe { libc::CMSG_FIRSTHDR(&recv_msg) };
-        assert!(!rec_cmsg.is_null());
-        assert_eq!(unsafe { (*rec_cmsg).cmsg_level }, libc::SOL_SOCKET);
-        assert_eq!(unsafe { (*rec_cmsg).cmsg_type }, libc::SCM_RIGHTS);
-        let rec_fd: libc::c_int = unsafe { *(libc::CMSG_DATA(rec_cmsg) as *const libc::c_int) };
-        assert!(rec_fd >= 0);
-
-        let flags = unsafe { libc::fcntl(rec_fd, libc::F_GETFD) };
+        let flags = unsafe { libc::fcntl(out.fds[0].as_raw_fd(), libc::F_GETFD) };
         assert!(flags & libc::FD_CLOEXEC != 0);
 
         assert_eq!(
-            unsafe { libc::write(rec_fd, b"ping".as_ptr().cast(), 4) },
+            unsafe { libc::write(out.fds[0].as_raw_fd(), b"ping".as_ptr().cast(), 4) },
             4
         );
         let mut p_buf = [0u8; 4];
-        assert_eq!(unsafe { libc::read(p_rx, p_buf.as_mut_ptr().cast(), 4) }, 4);
+        assert_eq!(
+            unsafe { libc::read(p_rx.as_raw_fd(), p_buf.as_mut_ptr().cast(), 4) },
+            4
+        );
         assert_eq!(&p_buf, b"ping");
+    }
 
-        unsafe {
-            libc::close(sock_tx);
-            libc::close(sock_rx);
-            libc::close(p_rx);
-            libc::close(p_tx);
-            libc::close(rec_fd);
-        }
+    fn make_owned_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }
 
     #[test]
     fn test_stdio_guard_close_on_drop() {
-        let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let (rx, tx) = (pipe_fds[0], pipe_fds[1]);
-
+        let (rx, tx) = make_owned_pipe();
+        let rx_raw = rx.as_raw_fd();
         {
-            let _guard = super::StdioGuard::new(Some(tx), None, None);
-            // _guard dropped here, closing tx
+            let _guard = StdioGuard::new(Some(tx), None, None);
         }
-
         let mut buf = [0u8; 1];
-        let n = unsafe { libc::read(rx, buf.as_mut_ptr().cast(), 1) };
+        let n = unsafe { libc::read(rx_raw, buf.as_mut_ptr().cast(), 1) };
         assert_eq!(n, 0, "Reading from pipe after guard drop should return EOF");
-        unsafe { libc::close(rx) };
     }
 
     #[test]
     fn test_stdio_guard_disarm() {
-        let mut pipe_fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
-        let (rx, tx) = (pipe_fds[0], pipe_fds[1]);
-
+        let (rx, tx) = make_owned_pipe();
+        let tx_raw;
         {
-            let mut guard = super::StdioGuard::new(Some(tx), None, None);
+            let mut guard = StdioGuard::new(Some(tx), None, None);
+            tx_raw = guard.stdin_fd.as_ref().unwrap().as_raw_fd();
             guard.disarm();
-            // _guard dropped here without closing tx
+            // Disarmed guard drops without closing: tx_raw stays open.
         }
-
-        assert_eq!(unsafe { libc::write(tx, b"a".as_ptr().cast(), 1) }, 1);
+        assert_eq!(unsafe { libc::write(tx_raw, b"a".as_ptr().cast(), 1) }, 1);
         let mut buf = [0u8; 1];
-        assert_eq!(unsafe { libc::read(rx, buf.as_mut_ptr().cast(), 1) }, 1);
+        assert_eq!(
+            unsafe { libc::read(rx.as_raw_fd(), buf.as_mut_ptr().cast(), 1) },
+            1
+        );
         assert_eq!(buf[0], b'a');
-
         unsafe {
-            libc::close(tx);
-            libc::close(rx);
+            libc::close(tx_raw);
         }
     }
 
     #[test]
     fn test_cmsg_buf_alignment() {
-        assert!(std::mem::align_of::<super::CmsgBuf>() >= 8);
-        assert!(std::mem::align_of::<super::CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>());
+        assert!(std::mem::align_of::<protocol::CmsgBuf>() >= 8);
+        assert!(
+            std::mem::align_of::<protocol::CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>()
+        );
     }
 
     #[test]
@@ -1272,5 +1445,45 @@ mod tests {
 
         let req_none = protocol::SpawnRequest::new(2, "/bin/echo", vec![]);
         assert_eq!(req_none.expected_fd_count(), 0);
+    }
+
+    #[test]
+    fn test_out_queue_cap() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let _peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let mut client = ClientInfo {
+            id: 1,
+            fd,
+            out_queue: VecDeque::with_capacity(16),
+        };
+        // Fill socket buffer so send() hits EAGAIN: use large packets until queued.
+        let big = vec![0u8; 32768];
+        for _ in 0..300 {
+            if !send_or_queue_response(&mut client, &big) {
+                break;
+            }
+            if !client.out_queue.is_empty() {
+                // Once queueing starts, keep filling to the cap.
+                continue;
+            }
+        }
+        // Force-fill to cap to verify bound independent of kernel buffer state.
+        while client.out_queue.len() < MAX_OUT_QUEUE_LEN {
+            client.out_queue.push_back(vec![1u8; 8]);
+        }
+        assert_eq!(client.out_queue.len(), MAX_OUT_QUEUE_LEN);
+        assert!(!send_or_queue_response(&mut client, &[1u8; 8]));
     }
 }

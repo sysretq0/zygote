@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.77"
+
 [profile.release]
 opt-level = 3
 lto = true
