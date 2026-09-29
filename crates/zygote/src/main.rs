@@ -360,6 +360,19 @@ unsafe fn close_inherited_except(preserved_fd: libc::c_int) {
     }
 }
 
+/// Portable errno read after a failed syscall (`__errno_location` is glibc-only;
+/// bionic/Android exposes `__errno` instead).
+#[cfg(target_os = "android")]
+#[inline]
+unsafe fn last_errno() -> i32 {
+    *libc::__errno()
+}
+#[cfg(not(target_os = "android"))]
+#[inline]
+unsafe fn last_errno() -> i32 {
+    *libc::__errno_location()
+}
+
 /// Child process logic executed immediately after fork().
 /// Does not return: always invokes execve() or exits with _exit(127).
 /// Performs ZERO heap allocations.
@@ -387,7 +400,7 @@ unsafe fn child_exec(
     // 2. Redirect stdio: custom SCM_RIGHTS file descriptors take precedence over redirect_null
     if let Some(fd) = stdin_fd {
         if libc::dup2(fd, libc::STDIN_FILENO) < 0 {
-            let err = *libc::__errno_location();
+            let err = last_errno();
             libc::write(pipe_tx_raw, (&err as *const i32).cast(), 4);
             libc::_exit(127);
         }
@@ -397,7 +410,7 @@ unsafe fn child_exec(
 
     if let Some(fd) = stdout_fd {
         if libc::dup2(fd, libc::STDOUT_FILENO) < 0 {
-            let err = *libc::__errno_location();
+            let err = last_errno();
             libc::write(pipe_tx_raw, (&err as *const i32).cast(), 4);
             libc::_exit(127);
         }
@@ -407,7 +420,7 @@ unsafe fn child_exec(
 
     if let Some(fd) = stderr_fd {
         if libc::dup2(fd, libc::STDERR_FILENO) < 0 {
-            let err = *libc::__errno_location();
+            let err = last_errno();
             libc::write(pipe_tx_raw, (&err as *const i32).cast(), 4);
             libc::_exit(127);
         }
@@ -418,7 +431,7 @@ unsafe fn child_exec(
     // 3. Change working directory if specified
     if let Some(dir) = cwd_ptr {
         if libc::chdir(dir) < 0 {
-            let err = *libc::__errno_location();
+            let err = last_errno();
             libc::write(pipe_tx_raw, (&err as *const i32).cast(), 4);
             libc::_exit(127);
         }
@@ -443,7 +456,7 @@ unsafe fn child_exec(
     libc::execve(path_ptr, argv_ptr, envp_ptr);
 
     // If execve returns, it failed: report errno to parent and exit
-    let err = *libc::__errno_location();
+    let err = last_errno();
     libc::write(pipe_tx_raw, (&err as *const i32).cast(), 4);
     libc::_exit(127);
 }
