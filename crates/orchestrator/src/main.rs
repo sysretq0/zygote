@@ -33,10 +33,11 @@ fn connect_abstract_seqpacket(abstract_name: &[u8]) -> std::io::Result<OwnedFd> 
         ));
     }
 
+    // (cast: sun_path is c_char — u8 on ARM/x86_64, i8 on x86).
     unsafe {
         std::ptr::copy_nonoverlapping(
             abstract_name.as_ptr(),
-            addr.sun_path.as_mut_ptr().add(1),
+            addr.sun_path.as_mut_ptr().cast::<u8>().add(1),
             abstract_name.len(),
         );
     }
@@ -98,10 +99,9 @@ impl ZygoteClient {
         if let Ok(peer_uid) = protocol::peer_cred_uid(owned_fd.as_raw_fd()) {
             let my_euid = unsafe { libc::geteuid() };
             if peer_uid != my_euid && peer_uid != 0 {
-                return Err(format!(
-                    "Zygote server UID {peer_uid} != client EUID {my_euid}"
-                )
-                .into());
+                return Err(
+                    format!("Zygote server UID {peer_uid} != client EUID {my_euid}").into(),
+                );
             }
         }
         let async_fd = Arc::new(AsyncFd::new(owned_fd)?);
@@ -251,8 +251,7 @@ impl ZygoteClient {
                 }
 
                 // Borrow raw fds for sendmsg; OwnedFd vector stays alive until end of iteration.
-                let raw_fds: Vec<RawFd> =
-                    job.attached_fds.iter().map(|f| f.as_raw_fd()).collect();
+                let raw_fds: Vec<RawFd> = job.attached_fds.iter().map(|f| f.as_raw_fd()).collect();
                 loop {
                     let mut guard = match async_fd_writer.writable().await {
                         Ok(g) => g,
@@ -542,10 +541,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[orchestrator] Verified spawn: child PID = {pid}");
         // pipe_tx ownership moved into the client; parent holds only pipe_rx so EOF
         // arrives as soon as the child exits. No sleep, no /tmp file.
-        let content =
-            read_pipe_to_string(&pipe_rx, Duration::from_secs(5)).map_err(|e| {
-                format!("Test 2 failed reading child stdout pipe: {e}")
-            })?;
+        let content = read_pipe_to_string(&pipe_rx, Duration::from_secs(5))
+            .map_err(|e| format!("Test 2 failed reading child stdout pipe: {e}"))?;
         assert!(
             !content.contains("SIGPIPE") && !content.contains("SIGCHLD"),
             "[orchestrator] FAILURE: Child inherited ignored signals: {content}"
@@ -571,10 +568,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             .map_err(|e| format!("Test 3 spawn failed: {e}"))?;
-        let content =
-            read_pipe_to_string(&pipe_rx, Duration::from_secs(5)).map_err(|e| {
-                format!("Test 3 failed reading child stdout pipe: {e}")
-            })?;
+        let content = read_pipe_to_string(&pipe_rx, Duration::from_secs(5))
+            .map_err(|e| format!("Test 3 failed reading child stdout pipe: {e}"))?;
         let parts: Vec<&str> = content.split_whitespace().collect();
         assert!(
             parts.len() >= 5,
@@ -638,10 +633,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("Test 4 spawn failed: {e}"))?;
         println!("[orchestrator] Spawned /bin/echo with custom stdout: PID = {pid}");
-        let received_output =
-            read_pipe_to_string(&pipe_rx, Duration::from_secs(5)).map_err(|e| {
-                format!("Test 4 failed reading child stdout pipe: {e}")
-            })?;
+        let received_output = read_pipe_to_string(&pipe_rx, Duration::from_secs(5))
+            .map_err(|e| format!("Test 4 failed reading child stdout pipe: {e}"))?;
         assert!(
             !received_output.is_empty(),
             "Failed to read from child custom stdout pipe"
@@ -703,7 +696,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             resp.result
         );
         assert!(matches!(resp.result, Err(ref s) if s.contains("Payload exceeds max packet size")));
-        assert_eq!(resp.id, req_id, "Truncated-packet reply must carry the request id");
+        assert_eq!(
+            resp.id, req_id,
+            "Truncated-packet reply must carry the request id"
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -998,7 +994,10 @@ mod tests {
             revents: 0,
         };
         let r = unsafe { libc::poll(&mut pfd, 1, 2000) };
-        assert!(r > 0, "Server end saw no event after client drop (socket leaked?)");
+        assert!(
+            r > 0,
+            "Server end saw no event after client drop (socket leaked?)"
+        );
         let mut buf = [0u8; 16];
         let n = unsafe {
             libc::recv(

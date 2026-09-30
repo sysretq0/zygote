@@ -216,10 +216,11 @@ fn create_listener_seqpacket(abstract_name: &[u8]) -> Result<OwnedFd, std::io::E
     }
 
     // Abstract socket name begins with \0, followed by name bytes
+    // (cast: sun_path is c_char — u8 on ARM/x86_64, i8 on x86).
     unsafe {
         std::ptr::copy_nonoverlapping(
             abstract_name.as_ptr(),
-            addr.sun_path.as_mut_ptr().add(1),
+            addr.sun_path.as_mut_ptr().cast::<u8>().add(1),
             abstract_name.len(),
         );
     }
@@ -1048,8 +1049,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         let prefix_len = outcome.reported_len.min(req_buf.len());
-                        let req_id_opt =
-                            protocol::extract_req_id(&req_buf[..prefix_len]);
+                        let req_id_opt = protocol::extract_req_id(&req_buf[..prefix_len]);
 
                         // CTRUNC: ancillary data incomplete; fds already dropped.
                         if outcome.ctrunc {
@@ -1114,8 +1114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         expected_fds,
                                         rec_fds.len()
                                     );
-                                    let resp =
-                                        protocol::SpawnResponse::error(request.id, err_msg);
+                                    let resp = protocol::SpawnResponse::error(request.id, err_msg);
                                     let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
                                     if let Some(client) = clients.get_mut(&client_fd) {
                                         if !send_or_queue_response(client, &resp_buf) {
@@ -1128,12 +1127,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 // Split owned fds in wire order: stdin, stdout, stderr.
                                 let mut owned_iter = rec_fds.into_iter();
-                                let stdin_fd =
-                                    if request.pass_stdin { owned_iter.next() } else { None };
-                                let stdout_fd =
-                                    if request.pass_stdout { owned_iter.next() } else { None };
-                                let stderr_fd =
-                                    if request.pass_stderr { owned_iter.next() } else { None };
+                                let stdin_fd = if request.pass_stdin {
+                                    owned_iter.next()
+                                } else {
+                                    None
+                                };
+                                let stdout_fd = if request.pass_stdout {
+                                    owned_iter.next()
+                                } else {
+                                    None
+                                };
+                                let stderr_fd = if request.pass_stderr {
+                                    owned_iter.next()
+                                } else {
+                                    None
+                                };
 
                                 match launch_child(
                                     &request,
@@ -1180,8 +1188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             req_id,
                                             format!("Invalid packet: {e}"),
                                         );
-                                        let _ =
-                                            protocol::encode_packet_into(&resp, &mut resp_buf);
+                                        let _ = protocol::encode_packet_into(&resp, &mut resp_buf);
                                         if let Some(client) = clients.get_mut(&client_fd) {
                                             if !send_or_queue_response(client, &resp_buf) {
                                                 disconnected_clients.push(client_fd);
@@ -1231,9 +1238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // No root bypass: a root daemon rejects unprivileged peers by default.
                 let my_euid = unsafe { libc::geteuid() };
                 let peer_ok = match protocol::peer_cred_uid(client_raw) {
-                    Ok(peer_uid) => {
-                        protocol::peer_uid_allowed(peer_uid, my_euid, allow_uid)
-                    }
+                    Ok(peer_uid) => protocol::peer_uid_allowed(peer_uid, my_euid, allow_uid),
                     Err(_) => false,
                 };
                 if !peer_ok {
@@ -1262,7 +1267,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if err.raw_os_error() == Some(libc::EMFILE)
                     || err.raw_os_error() == Some(libc::ENFILE)
                 {
-                    log_warn(&format!("FD limit reached in accept4 ({err}), backing off 50ms"));
+                    log_warn(&format!(
+                        "FD limit reached in accept4 ({err}), backing off 50ms"
+                    ));
                     accept_backoff_until = Some(Instant::now() + Duration::from_millis(50));
                 } else if err.kind() != std::io::ErrorKind::WouldBlock
                     && err.kind() != std::io::ErrorKind::Interrupted
@@ -1367,20 +1374,16 @@ mod tests {
         let p_rx = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let p_tx = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
-        let sent = protocol::send_packet_with_fds(
-            sock_tx.as_raw_fd(),
-            b"hello",
-            &[p_tx.as_raw_fd()],
-        )
-        .expect("send");
+        let sent =
+            protocol::send_packet_with_fds(sock_tx.as_raw_fd(), b"hello", &[p_tx.as_raw_fd()])
+                .expect("send");
         assert_eq!(sent, 5);
         drop(p_tx);
 
         let mut recv_buf = [0u8; 64];
         let mut cmsg = protocol::CmsgBuf::new();
-        let out =
-            protocol::recv_packet_with_fds(sock_rx.as_raw_fd(), &mut recv_buf, &mut cmsg)
-                .expect("recv");
+        let out = protocol::recv_packet_with_fds(sock_rx.as_raw_fd(), &mut recv_buf, &mut cmsg)
+            .expect("recv");
         assert_eq!(out.reported_len, 5);
         assert_eq!(&recv_buf[..5], b"hello");
         assert_eq!(out.fds.len(), 1);
@@ -1443,9 +1446,7 @@ mod tests {
     #[test]
     fn test_cmsg_buf_alignment() {
         assert!(std::mem::align_of::<protocol::CmsgBuf>() >= 8);
-        assert!(
-            std::mem::align_of::<protocol::CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>()
-        );
+        assert!(std::mem::align_of::<protocol::CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>());
     }
 
     #[test]

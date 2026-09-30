@@ -275,8 +275,7 @@ pub fn recv_packet_with_fds(
                 let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
                 let base_len = libc::CMSG_LEN(0) as usize;
                 if (*cmsg).cmsg_len >= base_len {
-                    let num =
-                        ((*cmsg).cmsg_len - base_len) / std::mem::size_of::<RawFd>();
+                    let num = ((*cmsg).cmsg_len - base_len) / std::mem::size_of::<RawFd>();
                     for i in 0..num {
                         let raw = *data_ptr.add(i);
                         if raw >= 0 {
@@ -324,7 +323,11 @@ pub fn peer_cred_uid(fd: RawFd) -> Result<libc::uid_t, std::io::Error> {
 /// No implicit root bypass: a root daemon still rejects unprivileged peers
 /// unless `--allow-uid <uid>` was given.
 #[inline]
-pub fn peer_uid_allowed(peer_uid: libc::uid_t, my_euid: libc::uid_t, allow_uid: Option<u32>) -> bool {
+pub fn peer_uid_allowed(
+    peer_uid: libc::uid_t,
+    my_euid: libc::uid_t,
+    allow_uid: Option<u32>,
+) -> bool {
     peer_uid == my_euid || Some(peer_uid) == allow_uid
 }
 
