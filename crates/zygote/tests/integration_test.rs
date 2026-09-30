@@ -81,7 +81,11 @@ fn connect() -> Result<OwnedFd, std::io::Error> {
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let name = protocol::DEFAULT_ABSTRACT_NAME;
     unsafe {
-        std::ptr::copy_nonoverlapping(name.as_ptr(), addr.sun_path.as_mut_ptr().add(1), name.len());
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            addr.sun_path.as_mut_ptr().cast::<u8>().add(1),
+            name.len(),
+        );
     }
     let len = (std::mem::size_of::<libc::sa_family_t>() + 1 + name.len()) as libc::socklen_t;
     if unsafe { libc::connect(fd, (&addr as *const libc::sockaddr_un).cast(), len) } < 0 {
